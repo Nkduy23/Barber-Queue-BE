@@ -13,10 +13,7 @@ const app = express();
 const server = http.createServer(app);
 
 // ── CORS CONFIG ──────────────────────────────────────────────
-const allowedOrigins = [
-  "http://localhost:5173",
-  "https://your-frontend.vercel.app", // 🔥 nhớ sửa lại
-];
+const allowedOrigins = ["http://localhost:5173", "https://barber-queue-fe.vercel.app/"];
 
 // ── Middleware ───────────────────────────────────────────────
 app.use(
