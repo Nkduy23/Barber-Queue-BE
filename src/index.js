@@ -13,7 +13,25 @@ const app = express();
 const server = http.createServer(app);
 
 // ── CORS CONFIG ──────────────────────────────────────────────
-const allowedOrigins = ["http://localhost:5173", "https://barber-queue-fe.vercel.app/"];
+const allowedOrigins = ["http://localhost:5173", "https://barber-queue-fe.vercel.app"];
+
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      if (!origin) return callback(null, true);
+
+      if (
+        allowedOrigins.includes(origin) ||
+        origin.includes("vercel.app") // 🔥 cho phép tất cả domain vercel
+      ) {
+        return callback(null, true);
+      }
+
+      return callback(new Error("Not allowed by CORS"));
+    },
+    credentials: true,
+  }),
+);
 
 // ── Middleware ───────────────────────────────────────────────
 app.use(
