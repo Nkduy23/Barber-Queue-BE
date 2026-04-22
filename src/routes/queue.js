@@ -2,13 +2,17 @@ import { Router } from "express";
 import pool from "../db/index.js";
 import { authMiddleware } from "../middleware/authMiddleware.js";
 
-const UTC_TO_VN_DATE = (col) => `DATE((${col} AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Ho_Chi_Minh')`;
-
 const NOW_VN = `NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh'`;
 
 // Helper: lấy ngày VN hôm nay dạng string YYYY-MM-DD
 function todayVN() {
   return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Ho_Chi_Minh" });
+}
+
+// Helper: "HH:MM" → số phút từ 00:00
+function timeToMinutes(t) {
+  const [h, m] = String(t).split(":").map(Number);
+  return h * 60 + m;
 }
 
 export default function queueRoutes(io) {
@@ -50,31 +54,69 @@ export default function queueRoutes(io) {
     return result.rows[0] || { open_time: "08:00", close_time: "19:00", slot_minutes: 30 };
   }
 
-  // ── HELPER: Available slots (hỗ trợ ngày bất kỳ) ──────────
-  async function getAvailableSlots(dateStr = null) {
+  // ── HELPER: Available slots với barber-aware overlap check ──
+  // duration: số phút của dịch vụ mà khách muốn đặt (để check overlap đúng)
+  // Nếu không truyền → dùng slot_minutes mặc định (backward-compat)
+  async function getAvailableSlots(dateStr = null, newServiceDuration = null) {
     const targetDate = dateStr || todayVN();
     const settings = await getTodaySettings(targetDate);
 
-    const barbersResult = await pool.query(`SELECT COUNT(*) FROM barbers WHERE is_active = true`);
-    const activeBarbers = parseInt(barbersResult.rows[0].count) || 1;
+    // Lấy danh sách thợ đang active (từng người, không chỉ đếm)
+    const barbersResult = await pool.query(`SELECT id, name FROM barbers WHERE is_active = true ORDER BY id ASC`);
+    const barbers = barbersResult.rows;
+    const activeBarbers = barbers.length || 1;
 
-    const bookedResult = await pool.query(
+    // Duration của service mới muốn đặt (để tính overlap)
+    // Nếu không có → dùng slot_minutes (giữ behavior cũ)
+    const newDuration = newServiceDuration || settings.slot_minutes;
+
+    // Lấy toàn bộ booking đang active trong ngày (waiting + serving)
+    // Mỗi booking có: scheduled_time (HH:MM), total_duration, barber_id
+    // barber_id có thể NULL (chưa assign) → coi như "1 slot bất kỳ bị block"
+    const bookingsResult = await pool.query(
       `SELECT
-         TO_CHAR(scheduled_time, 'HH24:MI') AS time_slot,
-         COUNT(*) AS booked_count
+         TO_CHAR(scheduled_time, 'HH24:MI') AS start_slot,
+         COALESCE(total_duration, $2) AS duration,
+         barber_id
        FROM queues
        WHERE status IN ('waiting', 'serving')
          AND scheduled_time IS NOT NULL
-         AND booking_date = $1
-       GROUP BY time_slot`,
-      [targetDate],
+         AND booking_date = $1`,
+      [targetDate, settings.slot_minutes],
     );
 
-    const bookedMap = {};
-    bookedResult.rows.forEach((r) => {
-      bookedMap[r.time_slot] = parseInt(r.booked_count);
-    });
+    // Xây dựng map: barber_id (hoặc null) → mảng { startMin, endMin }
+    // Booking chưa có barber_id → lưu vào bucket "unassigned"
+    // Unassigned blocking: dùng "first-fit" — sẽ block thợ đầu tiên chưa bị block tại khoảng đó
+    // Để đơn giản: unassigned bookings block 1 "virtual slot" chung — đếm như cũ nhưng per-slot
 
+    // Strategy:
+    // - Với mỗi slot candidate [slotStart, slotStart + newDuration]:
+    //   - Với mỗi thợ: kiểm tra xem có booking nào của thợ đó overlap không
+    //     overlap = booking.start < slotEnd AND booking.end > slotStart
+    //   - Booking chưa assign barber → coi như "chiếm 1 thợ bất kỳ còn trống"
+    //     → đếm số unassigned bookings overlap → trừ vào available barbers sau khi đã trừ assigned
+
+    const assignedBookings = {}; // barber_id → [{ startMin, endMin }]
+    let unassignedOverlaps = {}; // slotKey → count (tính lúc check slot)
+
+    // Pre-process bookings
+    const allBookings = bookingsResult.rows.map((b) => ({
+      startMin: timeToMinutes(b.start_slot),
+      endMin: timeToMinutes(b.start_slot) + parseInt(b.duration),
+      barber_id: b.barber_id,
+    }));
+
+    // Group assigned bookings by barber
+    for (const b of allBookings) {
+      if (b.barber_id) {
+        if (!assignedBookings[b.barber_id]) assignedBookings[b.barber_id] = [];
+        assignedBookings[b.barber_id].push(b);
+      }
+    }
+    const unassignedBookings = allBookings.filter((b) => !b.barber_id);
+
+    // Generate slots
     const slots = [];
     const [openH, openM] = settings.open_time.split(":").map(Number);
     const [closeH, closeM] = settings.close_time.split(":").map(Number);
@@ -87,17 +129,42 @@ export default function queueRoutes(io) {
     const isToday = targetDate === todayVN();
 
     for (let m = openMinutes; m < closeMinutes - slotMin; m += slotMin) {
+      // Skip past slots (chỉ cho hôm nay, buffer 10 phút)
+      if (isToday && m < nowMinutes + 10) continue;
+
+      const slotStartMin = m;
+      const slotEndMin = m + newDuration; // end dựa trên duration service mới
+
       const h = Math.floor(m / 60);
       const min = m % 60;
       const timeStr = `${String(h).padStart(2, "0")}:${String(min).padStart(2, "0")}`;
-      if (isToday && m < nowMinutes + 10) continue;
-      const booked = bookedMap[timeStr] || 0;
-      const available = activeBarbers - booked;
+
+      // Kiểm tra overlap: booking overlap với [slotStart, slotEnd] khi:
+      // booking.startMin < slotEndMin AND booking.endMin > slotStartMin
+      const overlaps = (b) => b.startMin < slotEndMin && b.endMin > slotStartMin;
+
+      // Số thợ bị block bởi booking đã assign
+      let assignedBlocked = 0;
+      for (const barber of barbers) {
+        const barberBookings = assignedBookings[barber.id] || [];
+        if (barberBookings.some(overlaps)) {
+          assignedBlocked++;
+        }
+      }
+
+      // Số thợ còn trống sau assigned blocking
+      const remainingFree = activeBarbers - assignedBlocked;
+
+      // Unassigned bookings overlap tại slot này chiếm slot từ thợ còn trống
+      const unassignedBlocked = unassignedBookings.filter(overlaps).length;
+
+      const available = Math.max(0, remainingFree - unassignedBlocked);
+
       slots.push({
         time: timeStr,
         label: timeStr,
         totalCapacity: activeBarbers,
-        booked,
+        booked: assignedBlocked + unassignedBlocked,
         available,
         isFull: available <= 0,
       });
@@ -110,10 +177,12 @@ export default function queueRoutes(io) {
   // PUBLIC ROUTES
   // ═══════════════════════════════════════════════════════════
 
-  // GET /api/queue/slots?date=YYYY-MM-DD
+  // GET /api/queue/slots?date=YYYY-MM-DD&duration=120
+  // duration: tổng số phút của các dịch vụ user đang chọn (optional)
   router.get("/slots", async (req, res) => {
     try {
-      const data = await getAvailableSlots(req.query.date || null);
+      const duration = req.query.duration ? parseInt(req.query.duration) : null;
+      const data = await getAvailableSlots(req.query.date || null, duration);
       res.json(data);
     } catch (err) {
       console.error(err);
@@ -139,7 +208,6 @@ export default function queueRoutes(io) {
       const activeBarbers = parseInt(barbersResult.rows[0].count) || 1;
       const waitingCount = parseInt(waiting.rows[0].count);
 
-      // Ước tính wait dựa trên total_duration trung bình hoặc slot_minutes
       const avgDurResult = await pool.query(
         `SELECT AVG(total_duration) AS avg_dur FROM queues
          WHERE status = 'waiting' AND booking_date = $1 AND total_duration IS NOT NULL`,
@@ -209,7 +277,6 @@ export default function queueRoutes(io) {
         if (r.status === "done") byBarber[key].done++;
       });
 
-      // Doanh thu ngày
       const revenueResult = await pool.query(
         `SELECT COALESCE(SUM(qs.price), 0) AS total_revenue
          FROM queues q
@@ -271,7 +338,7 @@ export default function queueRoutes(io) {
     }
   });
 
-  // POST /api/queue — đặt lịch (có thể ngày bất kỳ)
+  // POST /api/queue — đặt lịch
   router.post("/", async (req, res) => {
     const { name, phone, scheduled_time, booking_date, note, service_ids = [] } = req.body;
 
@@ -283,55 +350,71 @@ export default function queueRoutes(io) {
     }
 
     try {
-      // Xác định booking_date
       let bDate = booking_date || todayVN();
-
-      // Xây dựng scheduled datetime
       let scheduledDT = null;
+
+      // Lấy services trước để có total_duration cho slot check
+      const servicesResult = await pool.query(`SELECT id, duration, price FROM services WHERE id = ANY($1) AND is_active = true`, [service_ids]);
+      if (!servicesResult.rows.length) {
+        return res.status(400).json({ error: "Dịch vụ không hợp lệ" });
+      }
+      const totalDuration = servicesResult.rows.reduce((sum, s) => sum + s.duration, 0);
+
       if (scheduled_time) {
         if (/^\d{2}:\d{2}$/.test(scheduled_time)) {
           scheduledDT = `${bDate} ${scheduled_time}:00`;
         } else {
           scheduledDT = scheduled_time;
-          // Bóc date từ scheduled_time nếu không có booking_date
           if (!booking_date) {
             const m = String(scheduled_time).match(/(\d{4}-\d{2}-\d{2})/);
             if (m) bDate = m[1];
           }
         }
 
-        // Kiểm tra slot đầy
-        const barbersResult = await pool.query(`SELECT COUNT(*) FROM barbers WHERE is_active = true`);
-        const activeBarbers = parseInt(barbersResult.rows[0].count) || 1;
-        const slotCheck = await pool.query(
-          `SELECT COUNT(*) FROM queues
+        // ── Slot overlap check (barber-aware, JS-side) ─────────
+        const barbersResult = await pool.query(`SELECT id FROM barbers WHERE is_active = true`);
+        const activeBarbers = barbersResult.rows.length || 1;
+        const settings = await getTodaySettings(bDate);
+
+        const slotStartMin = timeToMinutes(scheduled_time.slice(0, 5));
+        const slotEndMin = slotStartMin + totalDuration;
+
+        // Fetch all active bookings for the day, filter overlap in JS
+        const allBookingsResult = await pool.query(
+          `SELECT
+             barber_id,
+             COALESCE(total_duration, $2) AS duration,
+             TO_CHAR(scheduled_time, 'HH24:MI') AS start_slot
+           FROM queues
            WHERE status IN ('waiting', 'serving')
              AND scheduled_time IS NOT NULL
-             AND booking_date = $1
-             AND TO_CHAR(scheduled_time, 'HH24:MI') = TO_CHAR($2::timestamp, 'HH24:MI')`,
-          [bDate, scheduledDT],
+             AND booking_date = $1`,
+          [bDate, settings.slot_minutes],
         );
-        if (parseInt(slotCheck.rows[0].count) >= activeBarbers) {
-          return res.status(409).json({ error: "Slot giờ này đã đầy, vui lòng chọn giờ khác" });
+
+        // Overlap: booking.start < slotEnd AND booking.end > slotStart
+        const overlapping = allBookingsResult.rows.filter((b) => {
+          const bStart = timeToMinutes(b.start_slot);
+          const bEnd = bStart + parseInt(b.duration);
+          return bStart < slotEndMin && bEnd > slotStartMin;
+        });
+
+        const assignedBlockedBarbers = new Set(overlapping.filter((b) => b.barber_id).map((b) => b.barber_id));
+        const unassignedCount = overlapping.filter((b) => !b.barber_id).length;
+        const available = Math.max(0, activeBarbers - assignedBlockedBarbers.size - unassignedCount);
+
+        if (available <= 0) {
+          return res.status(409).json({
+            error: `Slot ${scheduled_time} không đủ thợ cho dịch vụ ${totalDuration} phút, vui lòng chọn giờ khác`,
+          });
         }
       }
 
       // Anti-cheat: trùng SĐT trong ngày
-      const duplicate = await pool.query(
-        `SELECT id FROM queues
-         WHERE phone = $1 AND status IN ('waiting', 'serving') AND booking_date = $2`,
-        [phone, bDate],
-      );
+      const duplicate = await pool.query(`SELECT id FROM queues WHERE phone = $1 AND status IN ('waiting', 'serving') AND booking_date = $2`, [phone, bDate]);
       if (duplicate.rows.length > 0) {
         return res.status(409).json({ error: "Số điện thoại này đã có lịch ngày này" });
       }
-
-      // Lấy thông tin services để tính total_duration
-      const servicesResult = await pool.query(`SELECT id, duration, price FROM services WHERE id = ANY($1) AND is_active = true`, [service_ids]);
-      if (!servicesResult.rows.length) {
-        return res.status(400).json({ error: "Dịch vụ không hợp lệ" });
-      }
-      const totalDuration = servicesResult.rows.reduce((sum, s) => sum + s.duration, 0);
 
       // Tính position
       const posResult = await pool.query(`SELECT COALESCE(MAX(position), 0) + 1 AS next_pos FROM queues WHERE booking_date = $1`, [bDate]);
@@ -346,7 +429,7 @@ export default function queueRoutes(io) {
       );
       const peopleAhead = parseInt(aheadResult.rows[0].ahead);
 
-      // Insert queue entry
+      // Insert
       const result = await pool.query(
         `INSERT INTO queues (name, phone, status, position, scheduled_time, booking_date, note, total_duration)
          VALUES ($1, $2, 'waiting', $3, $4, $5, $6, $7)
@@ -355,15 +438,14 @@ export default function queueRoutes(io) {
       );
       const newEntry = result.rows[0];
 
-      // Insert queue_services
       for (const svc of servicesResult.rows) {
         await pool.query(`INSERT INTO queue_services (queue_id, service_id, duration, price) VALUES ($1, $2, $3, $4)`, [newEntry.id, svc.id, svc.duration, svc.price]);
       }
 
-      const settings = await getTodaySettings(bDate);
+      const settings2 = await getTodaySettings(bDate);
       const barbersResult2 = await pool.query(`SELECT COUNT(*) FROM barbers WHERE is_active = true`);
-      const activeBarbers = parseInt(barbersResult2.rows[0].count) || 1;
-      const estimatedWait = Math.ceil(peopleAhead / activeBarbers) * (totalDuration || settings.slot_minutes);
+      const activeBarbers2 = parseInt(barbersResult2.rows[0].count) || 1;
+      const estimatedWait = Math.ceil(peopleAhead / activeBarbers2) * (totalDuration || settings2.slot_minutes);
 
       await broadcastQueue(bDate);
       res.status(201).json({
@@ -383,20 +465,18 @@ export default function queueRoutes(io) {
   // ADMIN ROUTES
   // ═══════════════════════════════════════════════════════════
 
-  // POST /api/queue/walk-in — thêm khách vãng lai, start luôn
+  // POST /api/queue/walk-in
   router.post("/walk-in", authMiddleware, async (req, res) => {
     const { barber_id, name, service_ids = [] } = req.body;
     if (!barber_id) return res.status(400).json({ error: "Thiếu barber_id" });
 
     try {
-      // Kiểm tra thợ đang bận không
       const busyCheck = await pool.query(`SELECT id FROM queues WHERE barber_id = $1 AND status = 'serving' AND booking_date = $2`, [barber_id, todayVN()]);
       if (busyCheck.rows.length > 0) {
         return res.status(409).json({ error: "Thợ đang phục vụ khách khác" });
       }
 
-      // Lấy services nếu có
-      let totalDuration = 25; // default
+      let totalDuration = 25;
       let serviceRows = [];
       if (service_ids.length) {
         const svcRes = await pool.query(`SELECT id, duration, price FROM services WHERE id = ANY($1) AND is_active = true`, [service_ids]);
