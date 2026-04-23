@@ -62,7 +62,17 @@ export default function queueRoutes(io) {
     const settings = await getTodaySettings(targetDate);
 
     // Lấy danh sách thợ đang active (từng người, không chỉ đếm)
-    const barbersResult = await pool.query(`SELECT id, name FROM barbers WHERE is_active = true ORDER BY id ASC`);
+    // Chỉ lấy thợ active VÀ có lịch làm ngày đó (hoặc không có row → mặc định đi làm)
+    const barbersResult = await pool.query(
+      `SELECT b.id, b.name
+       FROM barbers b
+       LEFT JOIN barber_schedules bs
+         ON bs.barber_id = b.id AND bs.work_date = \$1
+       WHERE b.is_active = true
+         AND COALESCE(bs.is_working, true) = true
+       ORDER BY b.id ASC`,
+      [targetDate],
+    );
     const barbers = barbersResult.rows;
     const activeBarbers = barbers.length || 1;
 
@@ -340,7 +350,7 @@ export default function queueRoutes(io) {
 
   // POST /api/queue — đặt lịch
   router.post("/", async (req, res) => {
-    const { name, phone, scheduled_time, booking_date, note, service_ids = [] } = req.body;
+    const { name, phone, scheduled_time, booking_date, note, service_ids = [], barber_id } = req.body;
 
     if (!name || !phone) {
       return res.status(400).json({ error: "Thiếu tên hoặc số điện thoại" });
@@ -399,14 +409,41 @@ export default function queueRoutes(io) {
           return bStart < slotEndMin && bEnd > slotStartMin;
         });
 
-        const assignedBlockedBarbers = new Set(overlapping.filter((b) => b.barber_id).map((b) => b.barber_id));
-        const unassignedCount = overlapping.filter((b) => !b.barber_id).length;
-        const available = Math.max(0, activeBarbers - assignedBlockedBarbers.size - unassignedCount);
+        // const assignedBlockedBarbers = new Set(overlapping.filter((b) => b.barber_id).map((b) => b.barber_id));
+        // const unassignedCount = overlapping.filter((b) => !b.barber_id).length;
+        // const available = Math.max(0, activeBarbers - assignedBlockedBarbers.size - unassignedCount);
 
-        if (available <= 0) {
-          return res.status(409).json({
-            error: `Slot ${scheduled_time} không đủ thợ cho dịch vụ ${totalDuration} phút, vui lòng chọn giờ khác`,
+        if (barber_id) {
+          const barberCheck = await pool.query(`SELECT id FROM barbers WHERE id = $1 AND is_active = true`, [barber_id]);
+
+          if (barberCheck.rows.length === 0) {
+            return res.status(400).json({
+              error: "Thợ không hợp lệ",
+            });
+          }
+
+          const isBusy = overlapping.some((b) => {
+            const bStart = timeToMinutes(b.start_slot);
+            const bEnd = bStart + parseInt(b.duration);
+            return b.barber_id === barber_id && bStart < slotEndMin && bEnd > slotStartMin;
           });
+
+          if (isBusy) {
+            return res.status(409).json({
+              error: "Thợ này đã có lịch giờ này, vui lòng chọn giờ khác",
+            });
+          }
+        } else {
+          const assignedBlockedBarbers = new Set(overlapping.filter((b) => b.barber_id).map((b) => b.barber_id));
+          const unassignedCount = overlapping.filter((b) => !b.barber_id).length;
+
+          const available = Math.max(0, activeBarbers - assignedBlockedBarbers.size - unassignedCount);
+
+          if (available <= 0) {
+            return res.status(409).json({
+              error: `Slot ${scheduled_time} không đủ thợ`,
+            });
+          }
         }
       }
 
@@ -431,10 +468,11 @@ export default function queueRoutes(io) {
 
       // Insert
       const result = await pool.query(
-        `INSERT INTO queues (name, phone, status, position, scheduled_time, booking_date, note, total_duration)
-         VALUES ($1, $2, 'waiting', $3, $4, $5, $6, $7)
-         RETURNING *`,
-        [name, phone, position, scheduledDT, bDate, note || null, totalDuration],
+        `INSERT INTO queues 
+   (name, phone, status, position, barber_id, scheduled_time, booking_date, note, total_duration)
+   VALUES ($1, $2, 'waiting', $3, $4, $5, $6, $7, $8)
+   RETURNING *`,
+        [name, phone, position, barber_id || null, scheduledDT, bDate, note || null, totalDuration],
       );
       const newEntry = result.rows[0];
 
