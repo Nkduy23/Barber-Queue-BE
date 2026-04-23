@@ -485,14 +485,69 @@ export default function queueRoutes(io) {
       const activeBarbers2 = parseInt(barbersResult2.rows[0].count) || 1;
       const estimatedWait = Math.ceil(peopleAhead / activeBarbers2) * (totalDuration || settings2.slot_minutes);
 
+      // Tính display_position thực = thứ tự trong danh sách waiting+serving,
+      // sort theo scheduled_time ASC NULLS LAST, id ASC — đồng bộ với GET /api/queue
+      const displayPosResult = await pool.query(
+        `SELECT display_position FROM (
+           SELECT id,
+             ROW_NUMBER() OVER (
+               ORDER BY scheduled_time ASC NULLS LAST, id ASC
+             ) AS display_position
+           FROM queues
+           WHERE status IN ('waiting', 'serving')
+             AND booking_date = $1
+         ) ranked
+         WHERE id = $2`,
+        [bDate, newEntry.id],
+      );
+      const displayPosition = parseInt(displayPosResult.rows[0]?.display_position ?? position);
+
       await broadcastQueue(bDate);
       res.status(201).json({
         ...newEntry,
         services: servicesResult.rows,
-        display_position: position,
+        display_position: displayPosition,
+
         estimatedWaitMinutes: estimatedWait,
         peopleAhead,
       });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Lỗi server" });
+    }
+  });
+  // DELETE /api/queue/cancel
+  // Body: { phone, booking_date }
+  // Không cần auth — user tự hủy lịch của mình
+  router.delete("/cancel", async (req, res) => {
+    const { phone, booking_date } = req.body;
+
+    if (!phone || !booking_date) {
+      return res.status(400).json({ error: "Thiếu phone hoặc booking_date" });
+    }
+
+    try {
+      // Chỉ cho hủy lịch đang waiting (không hủy nếu đang serving hoặc đã done)
+      const result = await pool.query(
+        `UPDATE queues
+       SET status = 'skipped'
+       WHERE phone = $1
+         AND booking_date = $2
+         AND status = 'waiting'
+       RETURNING *`,
+        [phone, booking_date],
+      );
+
+      if (!result.rows.length) {
+        return res.status(404).json({
+          error: "Không tìm thấy lịch hẹn hoặc lịch đã được xử lý",
+        });
+      }
+
+      // Broadcast để cập nhật real-time queue
+      await broadcastQueue(booking_date);
+
+      res.json({ ok: true, cancelled: result.rows[0] });
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: "Lỗi server" });
