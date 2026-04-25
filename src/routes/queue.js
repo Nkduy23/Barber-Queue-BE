@@ -51,7 +51,7 @@ export default function queueRoutes(io) {
   async function getTodaySettings(date = null) {
     const targetDate = date || todayVN();
     const result = await pool.query(`SELECT * FROM shop_settings WHERE setting_date = $1`, [targetDate]);
-    return result.rows[0] || { open_time: "08:00", close_time: "19:00", slot_minutes: 30 };
+    return result.rows[0] || { open_time: "08:00", close_time: "20:00", slot_minutes: 30 };
   }
 
   // ── HELPER: Available slots với barber-aware overlap check ──
@@ -138,7 +138,7 @@ export default function queueRoutes(io) {
     const nowMinutes = nowVN.getHours() * 60 + nowVN.getMinutes();
     const isToday = targetDate === todayVN();
 
-    for (let m = openMinutes; m < closeMinutes - slotMin; m += slotMin) {
+    for (let m = openMinutes; m + newDuration <= closeMinutes; m += slotMin) {
       // Skip past slots (chỉ cho hôm nay, buffer 10 phút)
       if (isToday && m < nowMinutes + 10) continue;
 
@@ -617,7 +617,7 @@ export default function queueRoutes(io) {
            slot_minutes = EXCLUDED.slot_minutes,
            updated_at   = NOW()
          RETURNING *`,
-        [targetDate, open_time || "08:00", close_time || "19:00", slot_minutes || 30],
+        [targetDate, open_time || "08:00", close_time || "20:00", slot_minutes || 30],
       );
       io.emit("settings_updated", result.rows[0]);
       res.json(result.rows[0]);

@@ -9,6 +9,7 @@ import authRoutes from "./routes/auth.js";
 import serviceRoutes from "./routes/services.js";
 import schedulesRoutes from "./routes/schedules.js";
 import dashboardRoutes from "./routes/dashboard.js";
+import barberRoutes from "./routes/barbers.js";
 import { registerSocketEvents } from "./socket/events.js";
 
 const app = express();
@@ -42,6 +43,7 @@ app.use("/api/services", serviceRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/schedules", schedulesRoutes);
 app.use("/api/dashboard", dashboardRoutes);
+app.use("/api/barbers", barberRoutes);
 
 registerSocketEvents(io);
 

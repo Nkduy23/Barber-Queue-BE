@@ -322,4 +322,33 @@ router.post("/change-password", authMiddleware, async (req, res) => {
   }
 });
 
+// DELETE /api/auth/users/:id — xóa user (không xóa chính mình)
+router.delete("/users/:id", authMiddleware, async (req, res) => {
+  if (req.user.role !== "admin") {
+    return res.status(403).json({ error: "Không có quyền" });
+  }
+
+  const targetId = parseInt(req.params.id);
+
+  if (targetId === req.user.userId) {
+    return res.status(400).json({ error: "Không thể xóa tài khoản của chính mình" });
+  }
+
+  try {
+    // Revoke refresh tokens trước
+    await pool.query(`UPDATE refresh_tokens SET revoked = true WHERE user_id = $1`, [targetId]);
+
+    const result = await pool.query(`DELETE FROM users WHERE id = $1 RETURNING id, username`, [targetId]);
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: "Không tìm thấy user" });
+    }
+
+    res.json({ ok: true, deleted: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Lỗi server" });
+  }
+});
+
 export default router;
